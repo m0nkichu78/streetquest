@@ -4,7 +4,8 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { MapPinIcon } from "@heroicons/react/24/solid";
-import { HomeIcon } from "@heroicons/react/24/outline";
+import { HomeIcon, ChevronUpIcon } from "@heroicons/react/24/outline";
+import StreetDrawer, { type StreetInfo } from "@/components/StreetDrawer";
 import { useRouter } from "next/navigation";
 import { getUserId, loadExploration, saveExploration } from "@/lib/supabase";
 import BadgeNotification, { type Badge } from "@/components/BadgeNotification";
@@ -16,6 +17,7 @@ interface OsmPoint { lat: number; lon: number }
 interface OverpassWay {
   type: "way";
   id: number;
+  tags?: { name?: string; [key: string]: string | undefined };
   geometry: OsmPoint[];
 }
 
@@ -254,7 +256,7 @@ function streetsToGeoJSON(elements: OverpassWay[]): GeoJSON.FeatureCollection {
     features: elements.map((way) => ({
       type: "Feature",
       id: way.id,
-      properties: { id: way.id },
+      properties: { id: way.id, name: way.tags?.name ?? null },
       geometry: {
         type: "LineString",
         coordinates: way.geometry.map(({ lon, lat }) => [lon, lat]),
@@ -357,6 +359,44 @@ export default function MapView({ city, center }: Props) {
   const [mapError, setMapError] = useState<string | null>(null);
   const [currentBadge, setCurrentBadge] = useState<Badge | null>(null);
   const [hasPosition, setHasPosition] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [streetInfos, setStreetInfos] = useState<StreetInfo[]>([]);
+
+  // ── Drawer ────────────────────────────────────────────────────────────────
+
+  function handleOpenDrawer() {
+    const geojson = geojsonRef.current;
+    const coverages = segmentCoveragesRef.current;
+    if (!geojson || coverages.length === 0) return;
+
+    const infos: StreetInfo[] = coverages.map((cov) => {
+      const feature = geojson.features[cov.featureIndex];
+      const name = (feature.properties?.name as string | null) ?? "Rue sans nom";
+      const coverage = cov.validated
+        ? 100
+        : cov.samples.length > 0
+          ? Math.round((cov.covered.filter(Boolean).length / cov.samples.length) * 100)
+          : 0;
+      return { wayId: cov.wayId, name, coverage, validated: cov.validated, coords: cov.coords };
+    });
+
+    setStreetInfos(infos);
+    setDrawerOpen(true);
+  }
+
+  function handleStreetClick(street: StreetInfo) {
+    setDrawerOpen(false);
+    const map = mapRef.current;
+    if (!map || street.coords.length === 0) return;
+    const bounds = street.coords.reduce(
+      (b, coord) => b.extend(coord as mapboxgl.LngLatLike),
+      new mapboxgl.LngLatBounds(
+        street.coords[0] as mapboxgl.LngLatLike,
+        street.coords[0] as mapboxgl.LngLatLike,
+      ),
+    );
+    map.fitBounds(bounds, { padding: 80, duration: 600, maxZoom: 18 });
+  }
 
   // ── Badge queue ───────────────────────────────────────────────────────────
 
@@ -717,20 +757,27 @@ export default function MapView({ city, center }: Props) {
           <MapPinIcon className="h-6 w-6 text-white" />
         </button>
 
-        {/* Progress bar */}
-        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-72 rounded-2xl bg-black/70 px-5 py-3 backdrop-blur-sm">
+        {/* Progress bar — tap to open street list */}
+        <div
+          onClick={streetCount !== null ? handleOpenDrawer : undefined}
+          className="absolute bottom-6 left-1/2 -translate-x-1/2 w-72 rounded-2xl bg-black/70 px-5 py-3 backdrop-blur-sm"
+          style={{ cursor: streetCount !== null ? "pointer" : "default" }}
+        >
           {loading ? (
             <p className="text-center text-sm text-zinc-400">Chargement des rues…</p>
           ) : mapError ? (
             <p className="text-center text-sm text-red-400">{mapError}</p>
           ) : streetCount !== null ? (
             <>
-              <div className="flex items-baseline justify-between mb-2">
+              <div className="flex items-center justify-between mb-2">
                 <span className="text-xs text-zinc-400 uppercase tracking-wider">Exploration</span>
-                <span className="text-sm font-semibold text-white">
-                  {exploredCount}
-                  <span className="font-normal text-zinc-500"> / {streetCount} rues</span>
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-sm font-semibold text-white">
+                    {exploredCount}
+                    <span className="font-normal text-zinc-500"> / {streetCount} rues</span>
+                  </span>
+                  <ChevronUpIcon className="h-3.5 w-3.5 text-zinc-500" />
+                </div>
               </div>
               <div className="h-1.5 w-full rounded-full bg-zinc-800 overflow-hidden">
                 <div
@@ -743,6 +790,14 @@ export default function MapView({ city, center }: Props) {
           ) : null}
         </div>
       </div>
+
+      <StreetDrawer
+        isOpen={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        city={city}
+        streets={streetInfos}
+        onStreetClick={handleStreetClick}
+      />
     </>
   );
 }

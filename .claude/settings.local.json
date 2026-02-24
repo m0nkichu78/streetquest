@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cd \"/Users/mathieu/Documents/Projets IA 🤖/streetquest\" && npm run dev 2>&1)"
+      "Bash(cd \"/Users/mathieu/Documents/Projets IA 🤖/streetquest\" && npm run dev 2>&1)",
+      "Bash(cd \"/Users/mathieu/Documents/Projets IA 🤖/streetquest\" && git add app/page.tsx app/api/nominatim/reverse/ && git commit -m \"$\\(cat <<'EOF'\nfeat: bouton géolocalisation automatique sur la page d'accueil\n\n- Nouveau bouton MapPinIcon \\(outline\\) à côté du champ de recherche\n- Détecte la position GPS et reverse-geocode via /api/nominatim/reverse\n- Redirige directement vers /map avec city/lat/lon\n- Spinner pendant la détection, message d'erreur si refus\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\nEOF\n\\)\" && git push)",
+      "Bash(cd \"/Users/mathieu/Documents/Projets IA 🤖/streetquest\" && git add components/MapView.tsx && git commit -m \"$\\(cat <<'EOF'\nfeat: bouton home sur la page map\n\nCo-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\nEOF\n\\)\" && git push)"
     ]
   }
 }
