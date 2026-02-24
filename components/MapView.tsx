@@ -308,8 +308,6 @@ function boundaryToGeoJSON(relation: OverpassRelation): GeoJSON.FeatureCollectio
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MARLY_CENTER: [number, number] = [2.0889, 48.8698];
-const CITY = "Marly-le-Roi";
 const SAVE_EVERY_N = 10;
 
 const SAMPLE_STEP_METERS = 5;       // sample OSM segments every 5 m
@@ -329,7 +327,12 @@ const BADGE_DEFS: BadgeDef[] = [
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function MapView() {
+interface Props {
+  city: string;
+  center: [number, number];
+}
+
+export default function MapView({ city, center }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
   const markerRef = useRef<mapboxgl.Marker | null>(null);
@@ -468,13 +471,13 @@ export default function MapView() {
       savedCountRef.current = currentSize;
       saveExploration({
         user_id: userId,
-        city: CITY,
+        city,
         explored_way_ids: Array.from(validatedWayIdsRef.current),
         total_ways: total,
         badges: Array.from(unlockedBadgesRef.current),
       });
     }
-  }, []);
+  }, [city]);
 
   // ── Map init ──────────────────────────────────────────────────────────────
 
@@ -486,7 +489,7 @@ export default function MapView() {
     const map = new mapboxgl.Map({
       container: containerRef.current,
       style: "mapbox://styles/mapbox/dark-v11",
-      center: MARLY_CENTER,
+      center: center,
       zoom: 14,
     });
     mapRef.current = map;
@@ -498,8 +501,8 @@ export default function MapView() {
         userIdRef.current = userId;
 
         const [apiRes, savedData] = await Promise.all([
-          fetch(`/api/streets?city=${encodeURIComponent(CITY)}`),
-          loadExploration(userId, CITY),
+          fetch(`/api/streets?city=${encodeURIComponent(city)}`),
+          loadExploration(userId, city),
         ]);
         const { exploredIds: savedIds, badges: savedBadges } = savedData;
 
@@ -631,7 +634,7 @@ export default function MapView() {
       if (userId && geojson && validatedWayIdsRef.current.size > savedCountRef.current) {
         saveExploration({
           user_id: userId,
-          city: CITY,
+          city,
           explored_way_ids: Array.from(validatedWayIdsRef.current),
           total_ways: geojson.features.length,
           badges: Array.from(unlockedBadgesRef.current),
@@ -640,7 +643,8 @@ export default function MapView() {
       map.remove();
       mapRef.current = null;
     };
-  }, [updatePosition]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [updatePosition, city]);
 
   const progress = streetCount ? Math.round((exploredCount / streetCount) * 100) : 0;
 
@@ -668,6 +672,11 @@ export default function MapView() {
 
       <div className="relative w-full h-full">
         <div ref={containerRef} className="w-full h-full" />
+
+        {/* City name */}
+        <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-black/60 px-4 py-1.5 backdrop-blur-sm">
+          <span className="text-xs font-medium text-zinc-300">{city}</span>
+        </div>
 
         {/* Progress bar */}
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-72 rounded-2xl bg-black/70 px-5 py-3 backdrop-blur-sm">
