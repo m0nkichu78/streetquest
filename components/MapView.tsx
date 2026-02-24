@@ -22,33 +22,48 @@ interface OverpassRelation {
   members: { type: string; role: string; geometry?: OsmPoint[] }[];
 }
 
+interface SegmentCoverage {
+  wayId: number;
+  featureIndex: number;
+  samples: [number, number][]; // [lon, lat] every SAMPLE_STEP_METERS
+  covered: boolean[];          // per-sample flag
+  validated: boolean;
+}
+
 // ── Geo helpers ───────────────────────────────────────────────────────────────
 
-/**
- * Distance in metres from point P to segment AB.
- * Converts to a local metric space first so that the projection
- * parameter `t` is computed in metres (not raw degrees).
- */
-function distanceToSegmentMeters(
-  px: number, py: number,   // point  [lon, lat]
-  ax: number, ay: number,   // seg A  [lon, lat]
-  bx: number, by: number,   // seg B  [lon, lat]
+function distancePointToPoint(
+  px: number, py: number,
+  qx: number, qy: number,
 ): number {
   const cosLat = Math.cos((py * Math.PI) / 180);
-  // Convert to local metres
-  const pxm = px * 111000 * cosLat,  pym = py * 111000;
-  const axm = ax * 111000 * cosLat,  aym = ay * 111000;
-  const bxm = bx * 111000 * cosLat,  bym = by * 111000;
+  const dLon = (px - qx) * 111000 * cosLat;
+  const dLat = (py - qy) * 111000;
+  return Math.sqrt(dLon * dLon + dLat * dLat);
+}
 
-  const dx = bxm - axm;
-  const dy = bym - aym;
-  const lenSq = dx * dx + dy * dy;
-  const t = lenSq > 0
-    ? Math.max(0, Math.min(1, ((pxm - axm) * dx + (pym - aym) * dy) / lenSq))
-    : 0;
-  const cx = axm + t * dx;
-  const cy = aym + t * dy;
-  return Math.sqrt((pxm - cx) ** 2 + (pym - cy) ** 2);
+/**
+ * Sample a LineString at regular intervals (metres).
+ * Returns [lon, lat] points including the last vertex.
+ */
+function sampleLineString(coords: number[][], stepMeters: number): [number, number][] {
+  const points: [number, number][] = [];
+  for (let i = 0; i < coords.length - 1; i++) {
+    const [ax, ay] = coords[i];
+    const [bx, by] = coords[i + 1];
+    const cosLat = Math.cos((ay * Math.PI) / 180);
+    const dLon = (bx - ax) * 111000 * cosLat;
+    const dLat = (by - ay) * 111000;
+    const distM = Math.sqrt(dLon * dLon + dLat * dLat);
+    const steps = Math.max(1, Math.ceil(distM / stepMeters));
+    for (let j = 0; j < steps; j++) {
+      const t = j / steps;
+      points.push([ax + (bx - ax) * t, ay + (by - ay) * t]);
+    }
+  }
+  const last = coords[coords.length - 1];
+  points.push([last[0], last[1]]);
+  return points;
 }
 
 // ── GeoJSON converters ────────────────────────────────────────────────────────
@@ -71,7 +86,6 @@ function streetsToGeoJSON(elements: OverpassWay[]): GeoJSON.FeatureCollection {
 function assembleRings(ways: OsmPoint[][]): [number, number][][] {
   const rings: [number, number][][] = [];
   const remaining = ways.map((pts) => pts.map(({ lon, lat }): [number, number] => [lon, lat]));
-
   while (remaining.length > 0) {
     const ring: [number, number][] = [...remaining.shift()!];
     let guard = remaining.length * 2;
@@ -82,8 +96,7 @@ function assembleRings(ways: OsmPoint[][]): [number, number][][] {
       let matched = false;
       for (let i = 0; i < remaining.length; i++) {
         const seg = remaining[i];
-        const first = seg[0];
-        const last = seg[seg.length - 1];
+        const first = seg[0], last = seg[seg.length - 1];
         if (Math.abs(first[0] - tail[0]) < 1e-6 && Math.abs(first[1] - tail[1]) < 1e-6) {
           ring.push(...seg.slice(1)); remaining.splice(i, 1); matched = true; break;
         }
@@ -118,63 +131,25 @@ function boundaryToGeoJSON(relation: OverpassRelation): GeoJSON.FeatureCollectio
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MARLY_CENTER: [number, number] = [2.0833, 48.8666];
+const MARLY_CENTER: [number, number] = [2.0889, 48.8698];
 const CITY = "Marly-le-Roi";
 const SAVE_EVERY_N = 10;
 
-// Detection thresholds
-const EXPLORE_RADIUS_REAL = 20; // metres — GPS on mobile
-const EXPLORE_RADIUS_TEST = 35; // metres — test waypoints (wider to compensate snap error)
+// Coverage-based validation
+const SAMPLE_STEP_METERS = 5;      // sample OSM segments every 5 m
+const COVERAGE_RADIUS_METERS = 15; // GPS trace covers a sample if within 15 m
+const VALIDATION_THRESHOLD = 0.80; // 80 % of samples must be covered
 
-// OSM-verified anchor points forming a loop across Marly-le-Roi
-const TEST_WAYPOINTS: [number, number][] = [
-  [2.0934, 48.8697],
-  [2.0889, 48.8723],
-  [2.0812, 48.8701],
-  [2.0778, 48.8668],
-  [2.0823, 48.8642],
-];
-const TEST_INTERVAL_MS = 800; // fast steps between interpolated sub-points
-const TEST_STEP_METERS = 25;  // interpolation resolution
-
-/**
- * Linearly interpolate between each pair of waypoints at `stepMeters` intervals.
- * Produces a dense path so the marker "walks" the route and explores all nearby streets.
- */
-function buildTestPath(waypoints: [number, number][], stepMeters: number): [number, number][] {
-  const path: [number, number][] = [];
-  const loop = [...waypoints, waypoints[0]]; // close the loop
-
-  for (let i = 0; i < loop.length - 1; i++) {
-    const [lon1, lat1] = loop[i];
-    const [lon2, lat2] = loop[i + 1];
-    const cosLat = Math.cos((lat1 * Math.PI) / 180);
-    const dLon = (lon2 - lon1) * 111000 * cosLat;
-    const dLat = (lat2 - lat1) * 111000;
-    const distM = Math.sqrt(dLon * dLon + dLat * dLat);
-    const steps = Math.max(1, Math.ceil(distM / stepMeters));
-
-    for (let j = 0; j < steps; j++) {
-      const t = j / steps;
-      path.push([lon1 + (lon2 - lon1) * t, lat1 + (lat2 - lat1) * t]);
-    }
-  }
-  return path;
-}
-
-const TEST_PATH = buildTestPath(TEST_WAYPOINTS, TEST_STEP_METERS);
-
-// ── Badges ────────────────────────────────────────────────────────────────────
-
+// Badges
 interface BadgeDef extends Badge { threshold: number }
-
 const BADGE_DEFS: BadgeDef[] = [
-  { id: "first_step",  emoji: "🚶", name: "Premier pas",       threshold: 1   },
-  { id: "explorer",    emoji: "🗺️", name: "Explorateur",       threshold: 50  },
-  { id: "walker",      emoji: "🏃", name: "Marcheur",           threshold: 125 },
-  { id: "connoisseur", emoji: "🌆", name: "Connaisseur",        threshold: 249 },
-  { id: "master",      emoji: "🏆", name: "Maître de Marly",   threshold: 498 },
+  { id: "first_step",  emoji: "🚶", name: "Premier pas",     threshold: 1   },
+  { id: "explorer",    emoji: "🗺️", name: "Explorateur",     threshold: 50  },
+  { id: "walker",      emoji: "🏃", name: "Marcheur",         threshold: 125 },
+  { id: "connoisseur", emoji: "🌆", name: "Connaisseur",      threshold: 249 },
+  { id: "master",      emoji: "🏆", name: "Maître de Marly", threshold: 498 },
 ];
+
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
@@ -183,117 +158,26 @@ export default function MapView() {
   const mapRef = useRef<mapboxgl.Map | null>(null);
   const markerRef = useRef<mapboxgl.Marker | null>(null);
   const geojsonRef = useRef<GeoJSON.FeatureCollection | null>(null);
-  const exploredIdsRef = useRef<Set<number>>(new Set());
+
+  // System 1 – GPS trace
+  const traceCoordinatesRef = useRef<[number, number][]>([]);
+
+  // System 2 – Coverage-based validation
+  const segmentCoveragesRef = useRef<SegmentCoverage[]>([]);
+  const validatedWayIdsRef = useRef<Set<number>>(new Set());
+
   const watchIdRef = useRef<number | null>(null);
-  const testIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const testWaypointIndexRef = useRef<number>(0);
   const userIdRef = useRef<string | null>(null);
   const savedCountRef = useRef<number>(0);
   const unlockedBadgesRef = useRef<Set<string>>(new Set());
   const badgeQueueRef = useRef<Badge[]>([]);
-  // Mirror of currentBadge state — readable synchronously inside callbacks
-  // (avoids stale closure inside useCallback([], []))
   const currentBadgeRef = useRef<Badge | null>(null);
 
   const [streetCount, setStreetCount] = useState<number | null>(null);
   const [exploredCount, setExploredCount] = useState(0);
   const [loading, setLoading] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
-  const [testMode, setTestMode] = useState(false);
   const [currentBadge, setCurrentBadge] = useState<Badge | null>(null);
-
-  // ── Core position handler ─────────────────────────────────────────────────
-
-  const updatePosition = useCallback((lon: number, lat: number, isTest = false) => {
-    const map = mapRef.current;
-    if (!map || !map.isStyleLoaded()) return;
-
-    // Marker
-    if (!markerRef.current) {
-      const el = document.createElement("div");
-      el.className = "user-marker";
-      markerRef.current = new mapboxgl.Marker({ element: el })
-        .setLngLat([lon, lat])
-        .addTo(map);
-    } else {
-      markerRef.current.setLngLat([lon, lat]);
-    }
-
-    // Explore nearby streets
-    const geojson = geojsonRef.current;
-    if (!geojson) return;
-
-    const threshold = isTest ? EXPLORE_RADIUS_TEST : EXPLORE_RADIUS_REAL;
-    let newlyExplored = false;
-    let globalMinDist = Infinity;
-
-    for (const feature of geojson.features) {
-      const id = feature.properties?.id as number;
-      if (exploredIdsRef.current.has(id)) continue;
-      const coords = (feature.geometry as GeoJSON.LineString).coordinates;
-      for (let i = 0; i < coords.length - 1; i++) {
-        const dist = distanceToSegmentMeters(
-          lon, lat,
-          coords[i][0], coords[i][1],
-          coords[i + 1][0], coords[i + 1][1],
-        );
-        if (dist < globalMinDist) globalMinDist = dist;
-        if (dist <= threshold) {
-          exploredIdsRef.current.add(id);
-          newlyExplored = true;
-          console.log(`[explore] MATCH  id=${id}  dist=${dist.toFixed(1)}m  threshold=${threshold}m  pos=[${lon.toFixed(5)}, ${lat.toFixed(5)}]`);
-          break;
-        }
-      }
-    }
-
-    console.log(`[explore] pos=[${lon.toFixed(5)}, ${lat.toFixed(5)}]  minDist=${globalMinDist.toFixed(1)}m  matched=${newlyExplored}`);
-
-    if (newlyExplored) {
-      const currentSize = exploredIdsRef.current.size;
-      const exploredFeatures = geojson.features.filter(
-        (f) => exploredIdsRef.current.has(f.properties?.id as number),
-      );
-      (map.getSource("streets-explored") as mapboxgl.GeoJSONSource | undefined)?.setData({
-        type: "FeatureCollection",
-        features: exploredFeatures,
-      });
-      setExploredCount(currentSize);
-
-      // Check for newly unlocked badges
-      const newBadges = BADGE_DEFS.filter(
-        (b) => !unlockedBadgesRef.current.has(b.id) && currentSize >= b.threshold,
-      );
-      newBadges.forEach((b) => {
-        unlockedBadgesRef.current.add(b.id);
-        badgeQueueRef.current.push({ id: b.id, emoji: b.emoji, name: b.name });
-        console.log(`[badge] Débloqué : ${b.name} (seuil ${b.threshold}, count ${currentSize})`);
-      });
-      if (newBadges.length > 0 && currentBadgeRef.current === null) {
-        // Read queue synchronously — no functional update needed
-        const next = badgeQueueRef.current.shift();
-        if (next) {
-          currentBadgeRef.current = next;
-          setCurrentBadge(next);
-          console.log(`[badge] Affichage : ${next.name}`);
-        }
-      }
-
-      // Save to Supabase every SAVE_EVERY_N new explorations
-      const userId = userIdRef.current;
-      const total = geojson.features.length;
-      if (userId && currentSize - savedCountRef.current >= SAVE_EVERY_N) {
-        savedCountRef.current = currentSize;
-        saveExploration({
-          user_id: userId,
-          city: CITY,
-          explored_way_ids: Array.from(exploredIdsRef.current),
-          total_ways: total,
-          badges: Array.from(unlockedBadgesRef.current),
-        });
-      }
-    }
-  }, []);
 
   // ── Badge queue ───────────────────────────────────────────────────────────
 
@@ -307,30 +191,113 @@ export default function MapView() {
     }, 400);
   }, []);
 
-  // ── Test mode: cycle through real street waypoints ────────────────────────
+  // ── Core position handler ─────────────────────────────────────────────────
 
-  useEffect(() => {
-    if (testMode) {
-      // Start immediately at current path position
-      const [lon, lat] = TEST_PATH[testWaypointIndexRef.current % TEST_PATH.length];
-      updatePosition(lon, lat, true);
+  const updatePosition = useCallback((lon: number, lat: number) => {
+    const map = mapRef.current;
+    if (!map || !map.isStyleLoaded()) return;
 
-      testIntervalRef.current = setInterval(() => {
-        testWaypointIndexRef.current =
-          (testWaypointIndexRef.current + 1) % TEST_PATH.length;
-        const [wLon, wLat] = TEST_PATH[testWaypointIndexRef.current];
-        updatePosition(wLon, wLat, true);
-      }, TEST_INTERVAL_MS);
+    // 1. Marker
+    if (!markerRef.current) {
+      const el = document.createElement("div");
+      el.className = "user-marker";
+      markerRef.current = new mapboxgl.Marker({ element: el })
+        .setLngLat([lon, lat])
+        .addTo(map);
     } else {
-      if (testIntervalRef.current) {
-        clearInterval(testIntervalRef.current);
-        testIntervalRef.current = null;
+      markerRef.current.setLngLat([lon, lat]);
+    }
+
+    // 2. GPS trace
+    traceCoordinatesRef.current.push([lon, lat]);
+    if (traceCoordinatesRef.current.length >= 2) {
+      (map.getSource("gps-trace") as mapboxgl.GeoJSONSource | undefined)?.setData({
+        type: "FeatureCollection",
+        features: [{
+          type: "Feature",
+          properties: {},
+          geometry: { type: "LineString", coordinates: traceCoordinatesRef.current },
+        }],
+      });
+    }
+
+    // 3. Coverage-based street validation
+    const geojson = geojsonRef.current;
+    const coverages = segmentCoveragesRef.current;
+    if (!geojson || coverages.length === 0) return;
+
+    let newlyValidated = false;
+
+    for (const cov of coverages) {
+      if (cov.validated) continue;
+
+      let touched = false;
+      for (let i = 0; i < cov.samples.length; i++) {
+        if (cov.covered[i]) continue;
+        const dist = distancePointToPoint(cov.samples[i][0], cov.samples[i][1], lon, lat);
+        if (dist <= COVERAGE_RADIUS_METERS) {
+          cov.covered[i] = true;
+          touched = true;
+        }
+      }
+
+      if (touched) {
+        const ratio = cov.covered.filter(Boolean).length / cov.samples.length;
+        if (ratio >= VALIDATION_THRESHOLD) {
+          cov.validated = true;
+          validatedWayIdsRef.current.add(cov.wayId);
+          newlyValidated = true;
+          console.log(`[coverage] Validé wayId=${cov.wayId}  ratio=${(ratio * 100).toFixed(0)}%`);
+        }
       }
     }
-    return () => {
-      if (testIntervalRef.current) clearInterval(testIntervalRef.current);
-    };
-  }, [testMode, updatePosition]);
+
+    if (!newlyValidated) return;
+
+    // Update explored layer
+    const exploredFeatures = geojson.features.filter(
+      (f) => validatedWayIdsRef.current.has(f.properties?.id as number),
+    );
+    (map.getSource("streets-explored") as mapboxgl.GeoJSONSource | undefined)?.setData({
+      type: "FeatureCollection",
+      features: exploredFeatures,
+    });
+
+    const currentSize = validatedWayIdsRef.current.size;
+    setExploredCount(currentSize);
+
+    // Badge detection
+    const newBadges = BADGE_DEFS.filter(
+      (b) => !unlockedBadgesRef.current.has(b.id) && currentSize >= b.threshold,
+    );
+    newBadges.forEach((b) => {
+      unlockedBadgesRef.current.add(b.id);
+      badgeQueueRef.current.push({ id: b.id, emoji: b.emoji, name: b.name });
+      console.log(`[badge] Débloqué : ${b.name} (seuil ${b.threshold}, count ${currentSize})`);
+    });
+    if (newBadges.length > 0 && currentBadgeRef.current === null) {
+      const next = badgeQueueRef.current.shift();
+      if (next) {
+        currentBadgeRef.current = next;
+        setCurrentBadge(next);
+        console.log(`[badge] Affichage : ${next.name}`);
+      }
+    }
+
+    // Supabase save
+    const userId = userIdRef.current;
+    const total = geojson.features.length;
+    if (userId && currentSize - savedCountRef.current >= SAVE_EVERY_N) {
+      savedCountRef.current = currentSize;
+      saveExploration({
+        user_id: userId,
+        city: CITY,
+        explored_way_ids: Array.from(validatedWayIdsRef.current),
+        total_ways: total,
+        badges: Array.from(unlockedBadgesRef.current),
+      });
+    }
+  }, []);
 
   // ── Map init ──────────────────────────────────────────────────────────────
 
@@ -350,7 +317,6 @@ export default function MapView() {
     map.on("load", async () => {
       setLoading(true);
       try {
-        // Init user ID from localStorage
         const userId = getUserId();
         userIdRef.current = userId;
 
@@ -373,6 +339,35 @@ export default function MapView() {
         const geojson = streetsToGeoJSON(streets);
         geojsonRef.current = geojson;
 
+        // Pre-compute segment coverages
+        segmentCoveragesRef.current = geojson.features.map((f, idx) => {
+          const coords = (f.geometry as GeoJSON.LineString).coordinates;
+          const samples = sampleLineString(coords, SAMPLE_STEP_METERS);
+          return {
+            wayId: f.properties!.id as number,
+            featureIndex: idx,
+            samples,
+            covered: new Array(samples.length).fill(false),
+            validated: false,
+          };
+        });
+
+        // Restore previously validated segments
+        savedIds.forEach((id) => {
+          validatedWayIdsRef.current.add(id);
+          const cov = segmentCoveragesRef.current.find((c) => c.wayId === id);
+          if (cov) cov.validated = true;
+        });
+        savedBadges.forEach((id) => unlockedBadgesRef.current.add(id));
+        savedCountRef.current = savedIds.length;
+
+        const restoredFeatures = savedIds.length > 0
+          ? geojson.features.filter((f) => validatedWayIdsRef.current.has(f.properties?.id as number))
+          : [];
+
+        // ── Layers ──────────────────────────────────────────────────────────
+
+        // Streets — unexplored
         map.addSource("streets-unexplored", { type: "geojson", data: geojson });
         map.addLayer({
           id: "streets-unexplored", type: "line", source: "streets-unexplored",
@@ -380,16 +375,7 @@ export default function MapView() {
           paint: { "line-color": "#4a9eff", "line-opacity": 0.5, "line-width": 2.5 },
         });
 
-        // Restore previously explored IDs and badges
-        savedIds.forEach((id) => exploredIdsRef.current.add(id));
-        savedBadges.forEach((id) => unlockedBadgesRef.current.add(id));
-        savedCountRef.current = savedIds.length;
-
-        const restoredFeatures = savedIds.length > 0
-          ? geojson.features.filter((f) => exploredIdsRef.current.has(f.properties?.id as number))
-          : [];
-
-        // Streets – explored (pre-populated from Supabase)
+        // Streets — explored (validated, restored from Supabase)
         map.addSource("streets-explored", {
           type: "geojson",
           data: { type: "FeatureCollection", features: restoredFeatures },
@@ -397,14 +383,19 @@ export default function MapView() {
         map.addLayer({
           id: "streets-explored", type: "line", source: "streets-explored",
           layout: { "line-join": "round", "line-cap": "round" },
-          paint: { "line-color": "#00ff88", "line-opacity": 0.9, "line-width": 2.5 },
+          paint: { "line-color": "#00ff88", "line-opacity": 0.6, "line-width": 2.5 },
         });
 
-        setStreetCount(streets.length);
-        if (savedIds.length > 0) {
-          setExploredCount(savedIds.length);
-          console.log(`[supabase] restored ${savedIds.length} explored ways`);
-        }
+        // GPS trace (System 1 — grows in real time)
+        map.addSource("gps-trace", {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+        map.addLayer({
+          id: "gps-trace", type: "line", source: "gps-trace",
+          layout: { "line-join": "round", "line-cap": "round" },
+          paint: { "line-color": "#00ff88", "line-opacity": 0.9, "line-width": 3 },
+        });
 
         // City boundary
         if (relation) {
@@ -412,11 +403,14 @@ export default function MapView() {
           map.addLayer({
             id: "city-boundary", type: "line", source: "city-boundary",
             layout: { "line-join": "round", "line-cap": "round" },
-            paint: {
-              "line-color": "#4a9eff", "line-opacity": 0.8,
-              "line-width": 1.5, "line-dasharray": [3, 3],
-            },
+            paint: { "line-color": "#4a9eff", "line-opacity": 0.8, "line-width": 1.5, "line-dasharray": [3, 3] },
           });
+        }
+
+        setStreetCount(streets.length);
+        if (savedIds.length > 0) {
+          setExploredCount(savedIds.length);
+          console.log(`[supabase] Restored ${savedIds.length} validated ways, ${savedBadges.length} badges`);
         }
 
         // Real geolocation
@@ -437,14 +431,13 @@ export default function MapView() {
 
     return () => {
       if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current);
-      // Final save on unmount
       const userId = userIdRef.current;
       const geojson = geojsonRef.current;
-      if (userId && geojson && exploredIdsRef.current.size > savedCountRef.current) {
+      if (userId && geojson && validatedWayIdsRef.current.size > savedCountRef.current) {
         saveExploration({
           user_id: userId,
           city: CITY,
-          explored_way_ids: Array.from(exploredIdsRef.current),
+          explored_way_ids: Array.from(validatedWayIdsRef.current),
           total_ways: geojson.features.length,
           badges: Array.from(unlockedBadgesRef.current),
         });
@@ -507,29 +500,6 @@ export default function MapView() {
           ) : null}
         </div>
 
-        {/* Test mode toggle */}
-        <button
-          onClick={() => setTestMode((v) => !v)}
-          className={`absolute top-4 right-4 rounded-full border px-3 py-1.5 text-xs font-medium transition-all ${
-            testMode
-              ? "border-[#4a9eff]/50 bg-[#4a9eff]/10 text-[#4a9eff]"
-              : "border-zinc-700 bg-black/50 text-zinc-500 hover:text-zinc-300 hover:border-zinc-500"
-          }`}
-        >
-          {testMode ? "● Mode test" : "Mode test"}
-        </button>
-
-        {/* Temporary: test badge display */}
-        <button
-          onClick={() => {
-            const badge = { id: "test", emoji: "🚶", name: "Premier pas" };
-            currentBadgeRef.current = badge;
-            setCurrentBadge(badge);
-          }}
-          className="absolute top-4 left-4 rounded-full border border-zinc-700 bg-black/50 px-3 py-1.5 text-xs text-zinc-500 hover:text-zinc-300"
-        >
-          Test badge
-        </button>
       </div>
     </>
   );
