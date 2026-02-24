@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd \"/Users/mathieu/Documents/Projets IA 🤖/streetquest\" && npm run dev 2>&1)"
+    ]
+  }
+}
