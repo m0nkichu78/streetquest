@@ -4,8 +4,9 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { MapPinIcon } from "@heroicons/react/24/solid";
-import { HomeIcon, ChevronUpIcon } from "@heroicons/react/24/outline";
+import { HomeIcon, ChevronUpIcon, ArrowPathIcon } from "@heroicons/react/24/outline";
 import StreetDrawer, { type StreetInfo } from "@/components/StreetDrawer";
+import StreetToast from "@/components/StreetToast";
 import { useRouter } from "next/navigation";
 import { getUserId, loadExploration, saveExploration } from "@/lib/supabase";
 import BadgeNotification, { type Badge } from "@/components/BadgeNotification";
@@ -311,6 +312,15 @@ function boundaryToGeoJSON(relation: OverpassRelation): GeoJSON.FeatureCollectio
   };
 }
 
+function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.asin(Math.sqrt(a));
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const SAVE_EVERY_N = 10;
@@ -352,6 +362,11 @@ export default function MapView({ city, center }: Props) {
   const badgeQueueRef = useRef<Badge[]>([]);
   const currentBadgeRef = useRef<Badge | null>(null);
   const lastPositionRef = useRef<[number, number] | null>(null);
+  const orientationHandlerRef = useRef<((e: DeviceOrientationEvent) => void) | null>(null);
+  const sessionDistRef = useRef(0);
+  const sessionStartRef = useRef<number | null>(null);
+  const toastQueueRef = useRef<string[]>([]);
+  const currentToastRef = useRef<string | null>(null);
 
   const [streetCount, setStreetCount] = useState<number | null>(null);
   const [exploredCount, setExploredCount] = useState(0);
@@ -359,8 +374,67 @@ export default function MapView({ city, center }: Props) {
   const [mapError, setMapError] = useState<string | null>(null);
   const [currentBadge, setCurrentBadge] = useState<Badge | null>(null);
   const [hasPosition, setHasPosition] = useState(false);
+  const [compassActive, setCompassActive] = useState(false);
+  const [sessionDist, setSessionDist] = useState(0);
+  const [sessionTime, setSessionTime] = useState(0);
+  const [currentToast, setCurrentToast] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [streetInfos, setStreetInfos] = useState<StreetInfo[]>([]);
+
+  // ── Session timer ─────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!hasPosition) return;
+    sessionStartRef.current = Date.now();
+    const id = setInterval(() => {
+      setSessionTime(Math.floor((Date.now() - sessionStartRef.current!) / 1000));
+    }, 15000);
+    return () => clearInterval(id);
+  }, [hasPosition]);
+
+  // ── Toast queue ───────────────────────────────────────────────────────────
+
+  const handleToastDismiss = useCallback(() => {
+    currentToastRef.current = null;
+    setCurrentToast(null);
+    const next = toastQueueRef.current.shift() ?? null;
+    if (next) {
+      currentToastRef.current = next;
+      setCurrentToast(next);
+    }
+  }, []);
+
+  // ── Compass toggle ────────────────────────────────────────────────────────
+
+  const toggleCompass = useCallback(async () => {
+    if (compassActive) {
+      if (orientationHandlerRef.current) {
+        window.removeEventListener("deviceorientation", orientationHandlerRef.current);
+        orientationHandlerRef.current = null;
+      }
+      setCompassActive(false);
+      return;
+    }
+
+    // iOS 13+ requires permission
+    if (typeof (DeviceOrientationEvent as unknown as { requestPermission?: () => Promise<string> }).requestPermission === "function") {
+      const permission = await (DeviceOrientationEvent as unknown as { requestPermission: () => Promise<string> }).requestPermission();
+      if (permission !== "granted") return;
+    }
+
+    const handler = (e: DeviceOrientationEvent) => {
+      const map = mapRef.current;
+      if (!map) return;
+      // webkitCompassHeading (iOS) or derive from alpha (Android)
+      const heading = typeof (e as unknown as { webkitCompassHeading?: number }).webkitCompassHeading === "number"
+        ? (e as unknown as { webkitCompassHeading: number }).webkitCompassHeading
+        : e.alpha !== null ? (360 - e.alpha) % 360 : null;
+      if (heading !== null) map.rotateTo(heading, { duration: 150 });
+    };
+    orientationHandlerRef.current = handler;
+    window.addEventListener("deviceorientation", handler);
+    setCompassActive(true);
+  }, [compassActive]);
 
   // ── Drawer ────────────────────────────────────────────────────────────────
 
@@ -419,8 +493,14 @@ export default function MapView({ city, center }: Props) {
     const coverages = segmentCoveragesRef.current;
     if (!geojson || coverages.length === 0) return;
 
-    // 1. Store last known position and move marker
-    if (!lastPositionRef.current) setHasPosition(true);
+    // 1. Store last known position, update session distance, move marker
+    const prevPos = lastPositionRef.current;
+    if (!prevPos) setHasPosition(true);
+    else {
+      const dist = haversineKm(prevPos[1], prevPos[0], lat, lon);
+      sessionDistRef.current += dist;
+      setSessionDist(sessionDistRef.current);
+    }
     lastPositionRef.current = [lon, lat];
 
     if (!markerRef.current) {
@@ -481,7 +561,15 @@ export default function MapView({ city, center }: Props) {
 
     cov.validated = true;
     validatedWayIdsRef.current.add(cov.wayId);
-    console.log(`[coverage] Validé wayId=${cov.wayId}  ratio=${(ratio * 100).toFixed(0)}%`);
+
+    // Toast notification for this street
+    const streetName = (geojson.features.find((f) => f.properties?.id === cov.wayId)?.properties?.name as string | null) ?? "Rue sans nom";
+    toastQueueRef.current.push(streetName);
+    if (currentToastRef.current === null) {
+      const next = toastQueueRef.current.shift()!;
+      currentToastRef.current = next;
+      setCurrentToast(next);
+    }
 
     // Update streets-explored with full feature
     const exploredFeatures = geojson.features.filter(
@@ -542,6 +630,11 @@ export default function MapView({ city, center }: Props) {
       zoom: 14,
     });
     mapRef.current = map;
+
+    map.addControl(
+      new mapboxgl.NavigationControl({ visualizePitch: false, showZoom: false, showCompass: true }),
+      "top-right",
+    );
 
     map.on("load", async () => {
       setLoading(true);
@@ -678,6 +771,9 @@ export default function MapView({ city, center }: Props) {
 
     return () => {
       if (watchIdRef.current !== null) navigator.geolocation.clearWatch(watchIdRef.current);
+      if (orientationHandlerRef.current) {
+        window.removeEventListener("deviceorientation", orientationHandlerRef.current);
+      }
       const userId = userIdRef.current;
       const geojson = geojsonRef.current;
       if (userId && geojson && validatedWayIdsRef.current.size > savedCountRef.current) {
@@ -736,6 +832,32 @@ export default function MapView({ city, center }: Props) {
         <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-black/60 px-4 py-1.5 backdrop-blur-sm">
           <span className="text-xs font-medium text-zinc-300">{city}</span>
         </div>
+
+        {/* Session stats */}
+        {hasPosition && (
+          <div className="pointer-events-none absolute left-1/2 top-12 -translate-x-1/2 rounded-full bg-black/50 px-3 py-1 backdrop-blur-sm">
+            <span className="text-xs text-zinc-400">
+              {sessionDist.toFixed(1)} km · {Math.floor(sessionTime / 60)} min
+            </span>
+          </div>
+        )}
+
+        {/* Street toast */}
+        <StreetToast streetName={currentToast} onDismiss={handleToastDismiss} />
+
+        {/* Compass toggle button */}
+        <button
+          onClick={toggleCompass}
+          title={compassActive ? "Désactiver la boussole" : "Activer la boussole"}
+          className="absolute right-5 flex items-center justify-center rounded-full border transition-colors hover:border-zinc-500 hover:bg-zinc-800"
+          style={{
+            bottom: "200px", width: 48, height: 48,
+            background: compassActive ? "#1a3a2a" : "#1a1a1a",
+            borderColor: compassActive ? "#00ff88" : "#333",
+          }}
+        >
+          <ArrowPathIcon className="h-6 w-6" style={{ color: compassActive ? "#00ff88" : "white" }} />
+        </button>
 
         {/* Recenter button */}
         <button
