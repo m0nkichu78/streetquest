@@ -4,6 +4,8 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { MapPinIcon } from "@heroicons/react/24/solid";
+import { HomeIcon } from "@heroicons/react/24/outline";
+import { useRouter } from "next/navigation";
 import { getUserId, loadExploration, saveExploration } from "@/lib/supabase";
 import BadgeNotification, { type Badge } from "@/components/BadgeNotification";
 
@@ -334,6 +336,7 @@ interface Props {
 }
 
 export default function MapView({ city, center }: Props) {
+  const router = useRouter();
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
   const markerRef = useRef<mapboxgl.Marker | null>(null);
@@ -678,6 +681,16 @@ export default function MapView({ city, center }: Props) {
 
       <div className="relative w-full h-full">
         <div ref={containerRef} className="w-full h-full" />
+
+        {/* Home button */}
+        <button
+          onClick={() => router.push("/")}
+          title="Accueil"
+          className="absolute left-4 top-4 flex items-center justify-center rounded-full border transition-colors hover:border-zinc-500 hover:bg-zinc-800"
+          style={{ width: 48, height: 48, background: "#1a1a1a", borderColor: "#333" }}
+        >
+          <HomeIcon className="h-6 w-6 text-white" />
+        </button>
 
         {/* City name */}
         <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-black/60 px-4 py-1.5 backdrop-blur-sm">
