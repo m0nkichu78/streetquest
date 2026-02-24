@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@heroicons/react": "^2.2.0",
     "@supabase/supabase-js": "^2.97.0",
     "@types/mapbox-gl": "^3.4.1",
     "mapbox-gl": "^3.18.1",

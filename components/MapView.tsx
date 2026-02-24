@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
+import { MapPinIcon } from "@heroicons/react/24/solid";
 import { getUserId, loadExploration, saveExploration } from "@/lib/supabase";
 import BadgeNotification, { type Badge } from "@/components/BadgeNotification";
 
@@ -345,12 +346,14 @@ export default function MapView({ city, center }: Props) {
   const unlockedBadgesRef = useRef<Set<string>>(new Set());
   const badgeQueueRef = useRef<Badge[]>([]);
   const currentBadgeRef = useRef<Badge | null>(null);
+  const lastPositionRef = useRef<[number, number] | null>(null);
 
   const [streetCount, setStreetCount] = useState<number | null>(null);
   const [exploredCount, setExploredCount] = useState(0);
   const [loading, setLoading] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
   const [currentBadge, setCurrentBadge] = useState<Badge | null>(null);
+  const [hasPosition, setHasPosition] = useState(false);
 
   // ── Badge queue ───────────────────────────────────────────────────────────
 
@@ -373,7 +376,10 @@ export default function MapView({ city, center }: Props) {
     const coverages = segmentCoveragesRef.current;
     if (!geojson || coverages.length === 0) return;
 
-    // 1. Move marker to raw GPS position
+    // 1. Store last known position and move marker
+    if (!lastPositionRef.current) setHasPosition(true);
+    lastPositionRef.current = [lon, lat];
+
     if (!markerRef.current) {
       const el = document.createElement("div");
       el.className = "user-marker";
@@ -677,6 +683,26 @@ export default function MapView({ city, center }: Props) {
         <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-black/60 px-4 py-1.5 backdrop-blur-sm">
           <span className="text-xs font-medium text-zinc-300">{city}</span>
         </div>
+
+        {/* Recenter button */}
+        <button
+          onClick={() => {
+            const pos = lastPositionRef.current;
+            if (!pos || !mapRef.current) return;
+            mapRef.current.flyTo({ center: pos, zoom: 16, duration: 800 });
+          }}
+          disabled={!hasPosition}
+          title={hasPosition ? "Recentrer" : "Position non disponible"}
+          className="absolute bottom-28 right-4 flex items-center justify-center rounded-full border transition-opacity"
+          style={{
+            width: 48, height: 48,
+            background: "#1a1a1a",
+            borderColor: "#333",
+            opacity: hasPosition ? 1 : 0.4,
+          }}
+        >
+          <MapPinIcon className="h-6 w-6 text-white" />
+        </button>
 
         {/* Progress bar */}
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-72 rounded-2xl bg-black/70 px-5 py-3 backdrop-blur-sm">
