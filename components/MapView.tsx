@@ -693,7 +693,7 @@ export default function MapView({ city, center }: Props) {
           }}
           disabled={!hasPosition}
           title={hasPosition ? "Recentrer" : "Position non disponible"}
-          className="absolute bottom-28 right-4 flex items-center justify-center rounded-full border transition-opacity"
+          className="absolute bottom-36 right-5 flex items-center justify-center rounded-full border transition-opacity"
           style={{
             width: 48, height: 48,
             background: "#1a1a1a",
